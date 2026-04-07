@@ -1,0 +1,15 @@
+### URL Discovery Lambda - Test Request
+POST http://localhost:9000/2015-03-31/functions/function/invocations
+Content-Type: application/json
+
+{
+  "state_url": "https://extranet-sp.dhss.alaska.gov/hcs/medicaidalaska/Provider/Sites/FeeSchedule.html"
+}
+
+### Test with another state URL
+POST http://localhost:9000/2015-03-31/functions/function/invocations
+Content-Type: application/json
+
+{
+  "state_url": "https://www.medicaid.gov/"
+}

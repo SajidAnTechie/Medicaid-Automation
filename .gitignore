@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Environment files
+.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local runtime artifacts
+*.log
+
+# Postgres data directory (bind-mount — never commit raw DB files)
+postgres_data/
+
+# Data lake / checkpoint dirs
+data_lake/
+checkpoints/
+
+output/
+new/output/

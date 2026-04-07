@@ -1,0 +1,96 @@
+services:
+  db:
+    image: postgres:16
+    container_name: sentinel_state_db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sentinel_state"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  adminer:
+    image: adminer:latest
+    container_name: sentinel_state_adminer
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel_state_worker
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://localhost:11434}
+      AWS_ACCESS_KEY: ${AWS_ACCESS_KEY:-}
+      AWS_SECRET_KEY: ${AWS_SECRET_KEY:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      USE_BEDROCK: ${USE_BEDROCK:-false}
+      USE_BEDROCK_AGENT: ${USE_BEDROCK_AGENT:-false}
+      BEDROCK_AGENT_ID: ${BEDROCK_AGENT_ID:-}
+      BEDROCK_AGENT_ALIAS_ID: ${BEDROCK_AGENT_ALIAS_ID:-}
+      BEDROCK_AGENT_SESSION_ID: ${BEDROCK_AGENT_SESSION_ID:-sentinel-session}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      LLM_FALLBACK_CHAIN: ${LLM_FALLBACK_CHAIN:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RUNTIME_MODE: ${RUNTIME_MODE:-local}
+      PIPELINE_VERSION: ${PIPELINE_VERSION:-sentinel-state-v2}
+      BRONZE_BUCKET: ${BRONZE_BUCKET:-}
+      SILVER_BUCKET: ${SILVER_BUCKET:-}
+      CHECKPOINT_TABLE_NAME: ${CHECKPOINT_TABLE_NAME:-}
+      HITL_SNS_TOPIC_ARN: ${HITL_SNS_TOPIC_ARN:-}
+      DATA_LAKE_ROOT: ${DATA_LAKE_ROOT:-data_lake}
+      LOCAL_CHECKPOINT_DIR: ${LOCAL_CHECKPOINT_DIR:-checkpoints}
+      ANALYST_CONFIDENCE_THRESHOLD: ${ANALYST_CONFIDENCE_THRESHOLD:-85}
+      EXTRACTOR_THREADS: ${EXTRACTOR_THREADS:-6}
+    command: ["python", "main.py", "--idle"]
+
+  dashboard:
+    profiles: ["hitl"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel_state_dashboard
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      ANALYST_CONFIDENCE_THRESHOLD: ${ANALYST_CONFIDENCE_THRESHOLD:-85}
+    command: ["streamlit", "run", "hitl_dashboard.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    ports:
+      - "8501:8501"
+
+volumes:
+  pg_data:

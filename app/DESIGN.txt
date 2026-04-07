@@ -1,0 +1,1002 @@
+================================================================================
+  MEDICAID AUTOMATION — Pipeline Dashboard
+  Full System Design (Client-Only Architecture)
+================================================================================
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 1 — HIGH-LEVEL ARCHITECTURE
+████████████████████████████████████████████████████████████████████████████████
+
+1.1  SYSTEM OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+The entire application is a single-page React application (Vite) that runs
+entirely in the browser.  There is NO backend server.
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                        BROWSER (Client)                             │
+  │                                                                     │
+  │  ┌───────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
+  │  │  Cognito   │  │  Pipeline    │  │  IndexedDB   │  │  Web      │ │
+  │  │  Auth      │  │  Orchestrator│  │  (Dexie.js)  │  │  Workers  │ │
+  │  │  Module    │  │              │  │              │  │           │ │
+  │  └─────┬─────┘  └──────┬───────┘  └──────┬───────┘  └─────┬─────┘ │
+  │        │               │                 │               │       │
+  │        │    JWT Token   │   Store/Fetch   │   Parse JSON  │       │
+  │        ▼               ▼                 ▼               ▼       │
+  │  ┌─────────────────────────────────────────────────────────────┐   │
+  │  │                    React UI Layer                            │   │
+  │  │  ┌─────────────┐ ┌──────────────┐ ┌────────────────────┐   │   │
+  │  │  │ Pipeline     │ │ Payload      │ │ Execution History  │   │   │
+  │  │  │ Visualizer   │ │ Inspector    │ │ & Data Lineage     │   │   │
+  │  │  └─────────────┘ └──────────────┘ └────────────────────┘   │   │
+  │  └─────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────────┘
+                              │
+                    HTTPS + JWT Bearer
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    AWS Cloud                                        │
+  │                                                                     │
+  │  ┌──────────────┐   ┌──────────────────────────────────────────┐   │
+  │  │  Cognito      │   │  AgentCore Endpoints                     │   │
+  │  │  User Pool    │   │                                          │   │
+  │  │  (OAuth2)     │   │  POST /invocations  (Navigator)          │   │
+  │  │               │   │  POST /invocations  (Extractor)          │   │
+  │  └──────────────┘   │  POST /invocations  (CSV Exporter)       │   │
+  │                      │  POST /invocations  (Analysis)           │   │
+  │                      └──────────────────────────────────────────┘   │
+  │                                                                     │
+  │  ┌──────────────┐   ┌──────────────┐                               │
+  │  │ S3: medicaid- │   │ S3: medicaid- │                               │
+  │  │  fee-raw      │   │  fee-stage    │                               │
+  │  └──────────────┘   └──────────────┘                               │
+  └─────────────────────────────────────────────────────────────────────┘
+
+
+1.2  COMPONENT RESPONSIBILITIES
+────────────────────────────────────────────────────────────────────────────────
+
+  Component              Responsibility
+  ─────────────────────  ────────────────────────────────────────────────
+  Cognito Auth Module    OAuth2 login/logout, token refresh, session mgmt
+  Pipeline Orchestrator  Chains agent calls sequentially, handles failures,
+                         records execution state in IndexedDB
+  IndexedDB (Dexie.js)   Persists executions, agent steps, full payloads
+  Web Workers            Offloads heavy JSON parsing/decoding to background
+                         threads so UI stays responsive
+  Pipeline Visualizer    Renders the 4-agent flow as an interactive diagram
+  Payload Inspector      Displays large nested JSON with collapsible tree
+  Execution History      Lists all past runs with filters, search, replay
+  Data Lineage View      Side-by-side comparison of how data transforms
+  Error/Insights Panel   Surfaces schema drift, mapping confidence, quality
+
+
+1.3  WHAT RUNS WHERE
+────────────────────────────────────────────────────────────────────────────────
+
+  Browser (Client)                      AWS (Cloud)
+  ─────────────────────────────         ──────────────────────────────
+  • React SPA (Vite)                    • Cognito User Pool (OAuth2)
+  • Orchestration logic                 • AgentCore containers × 4
+  • JWT token management                • S3 buckets × 2
+  • IndexedDB storage                   • (CORS configured on AgentCore)
+  • JSON decoding/rendering
+  • All UI rendering
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 2 — INTERACTION FLOW
+████████████████████████████████████████████████████████████████████████████████
+
+2.1  FULL USER JOURNEY
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │  LOGIN   │────▶│  INPUT   │────▶│ EXECUTE  │────▶│ INSPECT  │
+  └──────────┘     └──────────┘     └──────────┘     └──────────┘
+
+  Step 1 — LOGIN
+    User opens app → redirected to Cognito Hosted UI → logs in →
+    redirected back with authorization code → app exchanges code for
+    JWT tokens (access + id + refresh) → stores in memory
+
+  Step 2 — INPUT
+    User sees dashboard → enters a state Medicaid portal URL →
+    clicks "Run Pipeline" → a new Execution record is created in
+    IndexedDB with status "running"
+
+  Step 3 — EXECUTE (browser-side orchestration)
+    The Pipeline Orchestrator runs this sequence:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │                                                             │
+    │  3a. Call Navigator AgentCore endpoint                      │
+    │      POST /invocations  { "prompt": "<portal_url>" }       │
+    │      + Authorization: Bearer <jwt>                          │
+    │      ↓                                                      │
+    │      Store Navigator response in IndexedDB                  │
+    │      Update UI: Navigator node → ✅                         │
+    │                                                             │
+    │  3b. Call Extractor AgentCore endpoint                      │
+    │      POST /invocations  { "prompt": "<navigator_json>" }   │
+    │      ↓                                                      │
+    │      Store Extractor response in IndexedDB                  │
+    │      Update UI: Extractor node → ✅                         │
+    │                                                             │
+    │  3c. Call CSV Exporter AgentCore endpoint                   │
+    │      POST /invocations  { "prompt": "<extractor_json>" }   │
+    │      ↓                                                      │
+    │      Store CSV Exporter response in IndexedDB               │
+    │      Update UI: CSV Exporter node → ✅                      │
+    │                                                             │
+    │  3d. Call Analysis AgentCore endpoint                       │
+    │      POST /invocations  { "prompt": "<s3_output_path>" }   │
+    │      ↓                                                      │
+    │      Store Analysis response in IndexedDB                   │
+    │      Update UI: Analysis node → ✅                          │
+    │                                                             │
+    │  3e. Mark Execution as "completed"                          │
+    │                                                             │
+    │  ON ERROR at any step:                                      │
+    │      Record error in the failed AgentStep                   │
+    │      Mark remaining steps as "skipped"                      │
+    │      Mark Execution as "failed"                             │
+    │      UI highlights the failed node in red                   │
+    │                                                             │
+    └─────────────────────────────────────────────────────────────┘
+
+  Step 4 — INSPECT
+    User clicks any agent node to see:
+      • Full input payload (formatted JSON tree)
+      • Full output payload (formatted JSON tree)
+      • Duration, timestamps, status
+      • Agent-specific insights (data quality, schema drift, etc.)
+    User can also view data lineage (side-by-side transforms)
+
+
+2.2  ORCHESTRATION PSEUDOCODE
+────────────────────────────────────────────────────────────────────────────────
+
+  async function runPipeline(portalUrl: string): Promise<void> {
+    const executionId = createExecution(portalUrl);
+
+    const agents = [
+      { name: "navigator",    buildPayload: (prev) => ({ prompt: portalUrl }) },
+      { name: "extractor",    buildPayload: (prev) => ({ prompt: JSON.stringify(prev) }) },
+      { name: "csv_exporter", buildPayload: (prev) => ({ prompt: JSON.stringify(prev) }) },
+      { name: "analysis",     buildPayload: (prev) => ({ prompt: prev.output_path }) },
+    ];
+
+    let previousOutput = null;
+
+    for (const agent of agents) {
+      const step = createAgentStep(executionId, agent.name, "running");
+      const payload = agent.buildPayload(previousOutput);
+      step.input = payload;
+      updateUI(agent.name, "running");
+
+      try {
+        const startTime = Date.now();
+        const response = await callAgentCore(agent.name, payload, jwtToken);
+        const duration = Date.now() - startTime;
+
+        step.output = response;
+        step.status = response.success ? "success" : "failed";
+        step.durationMs = duration;
+        step.completedAt = new Date().toISOString();
+        saveStep(step);
+        updateUI(agent.name, step.status);
+
+        if (!response.success) throw new Error(`${agent.name} returned success=false`);
+        previousOutput = response;
+
+      } catch (error) {
+        step.status = "failed";
+        step.error = error.message;
+        saveStep(step);
+        updateUI(agent.name, "failed");
+        markRemainingAsSkipped(executionId, agent.name);
+        markExecutionFailed(executionId, error.message);
+        return;
+      }
+    }
+
+    markExecutionCompleted(executionId);
+  }
+
+
+2.3  AgentCore ENDPOINT MAPPING
+────────────────────────────────────────────────────────────────────────────────
+
+  Agent          Endpoint URL (from config)
+  ───────────    ────────────────────────────────────────────────────────
+  Navigator      https://<agentcore-host>/agents/agentcore_navigator/invocations
+  Extractor      https://<agentcore-host>/agents/agentcore_extractor/invocations
+  CSV Exporter   https://<agentcore-host>/agents/raw_csv_exporter/invocations
+  Analysis       https://<agentcore-host>/agents/agentcore_analysis/invocations
+
+  All calls use:
+    Method:  POST
+    Headers: Content-Type: application/json
+             Authorization: Bearer <jwt_access_token>
+    Body:    { "prompt": "..." }
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 3 — DATA MODEL
+████████████████████████████████████████████████████████████████████████████████
+
+3.1  TYPESCRIPT INTERFACES
+────────────────────────────────────────────────────────────────────────────────
+
+  // ── Execution ──────────────────────────────────────────────────────
+
+  type ExecutionStatus = "running" | "completed" | "failed" | "cancelled";
+
+  interface Execution {
+    id:             string;          // UUID
+    portalUrl:      string;          // input state portal URL
+    stateName:      string;          // derived from Navigator output
+    status:         ExecutionStatus;
+    createdAt:      string;          // ISO-8601
+    completedAt:    string | null;
+    totalDurationMs: number | null;
+    error:          string | null;   // top-level failure reason
+    currentAgent:   AgentName | null; // which agent is currently running
+  }
+
+
+  // ── Agent Step ─────────────────────────────────────────────────────
+
+  type AgentName = "navigator" | "extractor" | "csv_exporter" | "analysis";
+  type StepStatus = "pending" | "running" | "success" | "failed" | "skipped";
+
+  interface AgentStep {
+    id:             string;          // UUID
+    executionId:    string;          // FK → Execution.id
+    agentName:      AgentName;
+    order:          number;          // 0..3
+    status:         StepStatus;
+    startedAt:      string | null;
+    completedAt:    string | null;
+    durationMs:     number | null;
+    input:          unknown;         // raw payload sent to agent
+    output:         unknown;         // raw response from agent
+    error:          string | null;   // error message if failed
+
+    // ── Agent-specific insights (extracted from output) ──
+    insights:       AgentInsights | null;
+  }
+
+
+  // ── Agent Insights ─────────────────────────────────────────────────
+
+  interface NavigatorInsights {
+    totalLinksDiscovered:  number;
+    relevantDatasets:      number;
+    portalType:            string;
+    crawledPages:          number;
+  }
+
+  interface ExtractorInsights {
+    tablesExtracted:       number;
+    totalRowsExtracted:    number;
+    mappingConfidence:     number;
+    dataQualityIssues:     string[];
+    schemaDriftDetected:   boolean;
+    fileSizeBytes:         number;
+    processingTimeSec:     number;
+  }
+
+  interface CsvExporterInsights {
+    rowsExported:          number;
+    columns:               string[];
+    s3OutputPath:          string;
+  }
+
+  interface AnalysisInsights {
+    s3OutputPath:          string;
+    canonicalHeaders:      number;   // count
+    cleaningSummary:       object;
+  }
+
+  type AgentInsights =
+    | NavigatorInsights
+    | ExtractorInsights
+    | CsvExporterInsights
+    | AnalysisInsights;
+
+
+3.2  INDEXEDDB SCHEMA (Dexie.js)
+────────────────────────────────────────────────────────────────────────────────
+
+  const db = new Dexie("MedicaidPipelineDB");
+
+  db.version(1).stores({
+    executions:  "id, status, createdAt, stateName",
+    agentSteps:  "id, executionId, agentName, [executionId+order]",
+  });
+
+  Tables:
+    executions  — one row per pipeline run
+    agentSteps  — four rows per execution (one per agent)
+
+  Indexes:
+    executions:  by status, createdAt (for filtering/sorting)
+    agentSteps:  by executionId (to load all steps for an execution)
+                 compound [executionId+order] (to load in sequence)
+
+  Storage notes:
+    • input/output are stored as-is (objects or strings) — IndexedDB
+      handles structured cloning of arbitrary JS objects
+    • For very large payloads (>10MB), we could store them as Blobs,
+      but Extractor output with 9,551 rows is ~2-3MB — well within limits
+    • IndexedDB in modern browsers supports hundreds of MBs per origin
+
+
+3.3  INSIGHT EXTRACTION
+────────────────────────────────────────────────────────────────────────────────
+
+  After each agent responds, the orchestrator extracts key metrics
+  from the raw output and stores them in step.insights:
+
+  function extractInsights(agentName: AgentName, output: any): AgentInsights {
+    switch (agentName) {
+      case "navigator":
+        return {
+          totalLinksDiscovered: output.total_links_discovered,
+          relevantDatasets:     output.relevant_datasets?.length ?? 0,
+          portalType:           output.portal_type,
+          crawledPages:         output.crawled_pages?.length ?? 0,
+        };
+      case "extractor":
+        return {
+          tablesExtracted:      output.extracted_tables?.length ?? 0,
+          totalRowsExtracted:   output.total_rows_extracted,
+          mappingConfidence:    output.extracted_tables?.[0]?.mapping_confidence ?? 0,
+          dataQualityIssues:    output.data_quality_issues ?? [],
+          schemaDriftDetected:  output.schema_drift_detected ?? false,
+          fileSizeBytes:        output.file_size_bytes,
+          processingTimeSec:    output.processing_time_seconds,
+        };
+      case "csv_exporter":
+        return {
+          rowsExported:  output.rows_exported,
+          columns:       output.columns ?? [],
+          s3OutputPath:  output.output_path,
+        };
+      case "analysis":
+        return {
+          s3OutputPath:      output.output_filepath,
+          canonicalHeaders:  0,  // extracted from full result if needed
+          cleaningSummary:   {},
+        };
+    }
+  }
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 4 — PAYLOAD HANDLING STRATEGY
+████████████████████████████████████████████████████████████████████████████████
+
+4.1  MULTI-LAYER JSON DECODING
+────────────────────────────────────────────────────────────────────────────────
+
+  Problem:
+    AgentCore payloads may be double- or triple-encoded:
+      '{"prompt": "{\"success\":true,...}"}'
+
+  Solution — recursive unwrap utility:
+
+    function deepDecode(value: unknown): unknown {
+      // Base case: not a string — return as-is
+      if (typeof value !== "string") {
+        if (typeof value === "object" && value !== null) {
+          // Recurse into object values
+          if (Array.isArray(value)) return value.map(deepDecode);
+          return Object.fromEntries(
+            Object.entries(value).map(([k, v]) => [k, deepDecode(v)])
+          );
+        }
+        return value;
+      }
+      // Try to parse the string as JSON
+      try {
+        const parsed = JSON.parse(value);
+        return deepDecode(parsed);  // recurse — may be another string
+      } catch {
+        return value;  // not JSON — return the raw string
+      }
+    }
+
+  Usage:
+    • Applied when STORING payloads in IndexedDB (decode once, store clean)
+    • Applied when RENDERING payloads in the Payload Inspector
+    • The Inspector also shows a "Raw" toggle to view the original encoded form
+
+
+4.2  LARGE PAYLOAD RENDERING
+────────────────────────────────────────────────────────────────────────────────
+
+  Problem:
+    Extractor output can have 9,551 rows of data in extracted_tables[0].data.
+    Rendering all rows as a JSON tree would freeze the browser.
+
+  Solution — three-tier approach:
+
+    Tier 1: Virtualized JSON Tree
+      Use a virtualized tree component (react-window or custom) that only
+      renders visible nodes.  Expanding a key with 9,551 children shows a
+      scrollable windowed list.
+
+    Tier 2: Lazy Expansion
+      Large arrays (>100 items) show a summary by default:
+        "data": [ Array(9551) — click to expand ]
+      On click, loads items in pages of 100 using virtual scroll.
+
+    Tier 3: Search Within Payload
+      Full-text search across keys and values using a Web Worker.
+      Results shown as highlighted paths:  "extracted_tables[0].data[423].procedure_code"
+
+
+4.3  PAYLOAD STORAGE IN INDEXEDDB
+────────────────────────────────────────────────────────────────────────────────
+
+  • Store DECODED payloads (after deepDecode) so queries and rendering
+    never need to re-parse
+  • Original encoded string optionally stored in a "rawInput" / "rawOutput"
+    field for debugging
+  • IndexedDB uses structured cloning — handles nested objects, arrays, nulls
+  • No size limit per record (practical limit ~250MB per origin in Chrome)
+  • Estimated storage per execution:
+      Navigator output:    ~5 KB
+      Extractor output:    ~2-5 MB (9,551 rows)
+      CSV Exporter output: ~1 KB
+      Analysis output:     ~1 KB
+      Total per execution: ~5 MB
+      → Can store ~100+ executions easily
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 5 — UX DESIGN & COMPONENT SPECIFICATIONS
+████████████████████████████████████████████████████████████████████████████████
+
+5.1  PAGE LAYOUT
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌─── Top Bar ────────────────────────────────────────────────────────┐
+  │  🏥 Medicaid Automation    [Execution History ▼]   [User ▼] [⚙]  │
+  └────────────────────────────────────────────────────────────────────┘
+  │                                                                    │
+  │  ┌─── Pipeline Visualizer (always visible) ────────────────────┐  │
+  │  │                                                              │  │
+  │  │   [ Navigator ] ──▶ [ Extractor ] ──▶ [ CSV ] ──▶ [ Analysis]│ │
+  │  │     ✅ 3.2s          🔄 running        ⬜ pending    ⬜ pending│ │
+  │  │                                                              │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                    │
+  │  ┌─── Detail Panel (below, shows selected agent) ──────────────┐  │
+  │  │                                                              │  │
+  │  │  [Input] [Output] [Insights] [Lineage]     ← Tab navigation │  │
+  │  │                                                              │  │
+  │  │  ┌─── JSON Tree ────────────────────────────────────────┐   │  │
+  │  │  │ { ▼                                                   │   │  │
+  │  │  │   "success": true,                                    │   │  │
+  │  │  │   "portal_url": "https://…",                          │   │  │
+  │  │  │   ▶ "relevant_datasets": [ Array(12) ]                │   │  │
+  │  │  │   "crawl_timestamp": "2026-04-04T…"                   │   │  │
+  │  │  │ }                                                     │   │  │
+  │  │  └──────────────────────────────────────────────────────┘   │  │
+  │  │                                                              │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+
+5.2  PIPELINE VISUALIZER — Component Spec
+────────────────────────────────────────────────────────────────────────────────
+
+  Component: <PipelineVisualizer execution={execution} steps={steps} />
+
+  Rendering:
+    Four nodes in a horizontal row connected by arrows.
+    Each node is a card showing:
+
+    ┌────────────────────────┐
+    │  🧭 Navigator          │  ← Agent icon + name
+    │  ───────────────────── │
+    │  Status: ✅ Success     │  ← Color-coded status badge
+    │  Duration: 3.2s        │
+    │  Links: 24 | Sets: 12  │  ← Key metric from insights
+    └────────────────────────┘
+
+  Status colors:
+    pending   →  grey      ⬜
+    running   →  blue      🔄  (with pulse animation)
+    success   →  green     ✅
+    failed    →  red       ❌
+    skipped   →  dark grey ⏭️
+
+  Arrows between nodes:
+    Solid green:   data successfully passed
+    Dashed grey:   not yet reached
+    Red with X:    flow stopped due to failure
+
+  Click behavior:
+    Clicking a node selects it → Detail Panel shows that agent's data
+
+
+5.3  PAYLOAD INSPECTOR — Component Spec
+────────────────────────────────────────────────────────────────────────────────
+
+  Component: <PayloadInspector data={payload} title="Navigator Output" />
+
+  Features:
+    • Collapsible JSON tree with syntax highlighting
+    • Type indicators:  string, number, boolean, null, array, object
+    • Color-coded values:
+        strings  →  green
+        numbers  →  blue
+        booleans →  orange
+        null     →  grey italic
+    • Array summary:  "data": [ Array(9551) ]  — click to expand with virtual scroll
+    • Copy button on each node (copies that subtree as JSON)
+    • "Copy All" button copies entire payload
+    • "Raw / Decoded" toggle — shows original encoded string vs decoded object
+    • Search bar — filters the tree to matching paths
+    • Path breadcrumb:  root > extracted_tables > [0] > data > [423]
+
+
+5.4  EXECUTION HISTORY — Component Spec
+────────────────────────────────────────────────────────────────────────────────
+
+  Component: <ExecutionHistory />
+
+  Layout:
+    ┌────────────────────────────────────────────────────────────────┐
+    │  🔍 Search [__________]   Status: [All ▼]   Sort: [Newest ▼]  │
+    ├────────────────────────────────────────────────────────────────┤
+    │  State      Portal URL              Status   Duration   Date  │
+    │  ─────────  ────────────────────── ──────── ────────── ────── │
+    │  Alaska     extranet-sp.dhss.al…    ✅       48.3s     Apr 4  │
+    │  Florida    ahca.myflorida.com/…    ❌       12.1s     Apr 3  │
+    │  Texas      hhs.texas.gov/…         ✅       67.8s     Apr 2  │
+    │  Alaska     extranet-sp.dhss.al…    ✅       51.2s     Mar 30 │
+    └────────────────────────────────────────────────────────────────┘
+
+  Click behavior:
+    Clicking a row loads that execution into the Pipeline Visualizer
+
+
+5.5  ERROR & INSIGHTS PANEL — Component Spec
+────────────────────────────────────────────────────────────────────────────────
+
+  Component: <InsightsPanel step={selectedStep} />
+
+  Displayed as a tab within the Detail Panel.  Content varies by agent:
+
+  Navigator:
+    ┌──────────────────────────────────────────┐
+    │  📊 Navigator Insights                    │
+    │  ─────────────────────────────────────── │
+    │  Links discovered:  24                   │
+    │  Relevant datasets: 12                   │
+    │  Portal type:       SharePoint           │
+    │  Pages crawled:     1                    │
+    │  Errors:            0                    │
+    └──────────────────────────────────────────┘
+
+  Extractor:
+    ┌──────────────────────────────────────────┐
+    │  📊 Extractor Insights                    │
+    │  ─────────────────────────────────────── │
+    │  Tables extracted:  1                    │
+    │  Total rows:        9,551                │
+    │  Mapping confidence: 90%  🟢             │
+    │  Schema drift:      None detected        │
+    │  File size:         589 KB               │
+    │  Processing time:   22.9s                │
+    │                                          │
+    │  ⚠️ Data Quality Issues (2):             │
+    │  • Header 'Requires Medical Justificati… │
+    │    appears truncated                     │
+    │  • Non-numeric value 'By Report' in rate │
+    └──────────────────────────────────────────┘
+
+  CSV Exporter:
+    ┌──────────────────────────────────────────┐
+    │  📊 CSV Exporter Insights                 │
+    │  ─────────────────────────────────────── │
+    │  Rows exported:    9,552                 │
+    │  Columns:          9                     │
+    │  S3 path:          s3://medicaid-fee-raw │
+    │                    /raw_exports/alaska/…  │
+    └──────────────────────────────────────────┘
+
+  Analysis:
+    ┌──────────────────────────────────────────┐
+    │  📊 Analysis Insights                     │
+    │  ─────────────────────────────────────── │
+    │  Output:  s3://medicaid-fee-stage/…      │
+    │  Status:  Cleaned & uploaded             │
+    └──────────────────────────────────────────┘
+
+
+5.6  DATA LINEAGE VIEW — Component Spec
+────────────────────────────────────────────────────────────────────────────────
+
+  Component: <DataLineage execution={execution} steps={steps} />
+
+  Purpose:
+    Show how data evolves across agents — side-by-side comparison.
+
+  Layout:
+    ┌────────────┬────────────┬────────────┬────────────┐
+    │ Navigator  │ Extractor  │ CSV Export │ Analysis   │
+    │ Output     │ Output     │ Output     │ Output     │
+    ├────────────┼────────────┼────────────┼────────────┤
+    │ discovered │ extracted  │ exported   │ cleaned    │
+    │ 12 dataset │ 9,551 rows │ to S3 raw  │ to S3 stage│
+    │ URLs       │ 9 columns  │ 9,552 rows │ canonical  │
+    │            │ mapped     │            │ headers    │
+    ├────────────┼────────────┼────────────┼────────────┤
+    │ Key fields:│ Key fields:│ Key fields:│ Key fields:│
+    │ url        │ proc_code  │ Proc Code  │ procedure_ │
+    │ title      │ rate       │ Max Allow  │   code     │
+    │ file_type  │ modifier   │ Proc Mod   │ fee_amount │
+    │ category   │ billing    │ Billing    │ modifier   │
+    └────────────┴────────────┴────────────┴────────────┘
+
+  Hover behavior:
+    Hovering over a field in one column highlights the corresponding
+    field(s) in adjacent columns (data lineage tracing).
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 6 — EDGE CASES & ERROR HANDLING
+████████████████████████████████████████████████████████████████████████████████
+
+6.1  DEEPLY NESTED / MULTI-LAYER JSON
+────────────────────────────────────────────────────────────────────────────────
+
+  Problem:
+    AgentCore wraps payloads in:
+      '{"prompt": "{\"success\":true, ...}"}'
+    Sometimes even triple-encoded.
+
+  Handling:
+    1. The orchestrator's deepDecode() runs on every response
+    2. The Payload Inspector has a "Raw ↔ Decoded" toggle
+    3. When building the next agent's input, the orchestrator encodes
+       exactly once:  { "prompt": JSON.stringify(previousOutput) }
+    4. For the Analysis agent, input is just the S3 path string:
+       { "prompt": "s3://..." }
+
+
+6.2  LARGE PAYLOAD RENDERING
+────────────────────────────────────────────────────────────────────────────────
+
+  Problem:
+    Extractor output with 9,551 rows ≈ 2-5 MB of JSON.  Rendering as
+    a DOM tree would create ~50,000+ nodes.
+
+  Handling:
+    1. Arrays with >50 items are collapsed by default:
+         "data": [ Array(9551) — click to load ]
+    2. On expand, show paginated virtual list (100 items visible at a time)
+    3. Each array item is itself collapsed:
+         [0]: { ▶ procedure_code: "0042T", ... }
+    4. Deep-copy and stringify operations run in a Web Worker
+    5. "Copy All" for large payloads generates the JSON in a Web Worker
+       and triggers a file download instead of clipboard copy
+
+
+6.3  PARTIAL FAILURES & RETRIES
+────────────────────────────────────────────────────────────────────────────────
+
+  Scenario: Extractor succeeds but CSV Exporter fails.
+
+  Handling:
+    1. Execution status → "failed"
+    2. Navigator step    → ✅ success  (green)
+    3. Extractor step    → ✅ success  (green)
+    4. CSV Exporter step → ❌ failed   (red, with error message)
+    5. Analysis step     → ⏭️ skipped  (grey)
+
+  Retry capability:
+    • "Retry from failure" button appears on failed executions
+    • Creates a NEW execution that starts from the failed step
+    • Uses the last successful step's output as input
+    • Previous execution is kept as-is for history
+
+  Implementation:
+    function retryFromFailure(executionId: string) {
+      const failedStep = findFirstFailedStep(executionId);
+      const previousStep = findStepBefore(executionId, failedStep.order);
+      const newExecution = createExecution(original.portalUrl);
+
+      // Copy successful steps from old execution
+      copySuccessfulSteps(executionId, newExecution.id, failedStep.order);
+
+      // Re-run from the failed agent onward
+      runPipelineFromStep(newExecution.id, failedStep.agentName, previousStep.output);
+    }
+
+
+6.4  NETWORK ERRORS & TIMEOUTS
+────────────────────────────────────────────────────────────────────────────────
+
+  • All AgentCore calls use AbortController with a configurable timeout
+    (default: 120s for Navigator/Extractor, 60s for others)
+  • Network errors are caught and stored in step.error with a descriptive
+    message ("Network timeout after 120s", "CORS error", etc.)
+  • User sees a toast notification immediately when an error occurs
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PHASE 7 — SECURITY DESIGN (Cognito + JWT)
+████████████████████████████████████████████████████████████████████████████████
+
+7.1  AUTHENTICATION FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │  User  │────▶│  React App   │────▶│  Cognito      │────▶│  AgentCore   │
+  │        │     │              │     │  User Pool    │     │  Endpoints   │
+  └────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+
+  Step 1: User opens app → App checks for valid session (tokens in memory)
+  Step 2: No session → Redirect to Cognito Hosted UI (OAuth2 Authorization Code flow)
+  Step 3: User authenticates → Cognito redirects back with auth code
+  Step 4: App exchanges code for tokens (access_token, id_token, refresh_token)
+  Step 5: Tokens stored in memory (NOT localStorage — security best practice)
+  Step 6: Every AgentCore call includes:  Authorization: Bearer <access_token>
+  Step 7: AgentCore validates the JWT against the Cognito User Pool
+  Step 8: On token expiry → App uses refresh_token to get new access_token silently
+
+
+7.2  TOKEN MANAGEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+  Token storage:
+    • access_token  → in-memory (React context / module-scoped variable)
+    • refresh_token → in-memory (or HttpOnly cookie if Cognito Hosted UI)
+    • NEVER in localStorage or sessionStorage (XSS risk)
+
+  Token refresh:
+    • Set a timer for (expiry - 60 seconds) to proactively refresh
+    • If a 401 response is received, attempt one silent refresh before
+      redirecting to login
+
+  Logout:
+    • Clear all tokens from memory
+    • Call Cognito logout endpoint to invalidate server-side session
+    • Redirect to login page
+
+
+7.3  API REQUEST INTERCEPTOR
+────────────────────────────────────────────────────────────────────────────────
+
+  Wrap all AgentCore calls through a single function:
+
+    async function callAgentCore(
+      agentName: string,
+      payload: object,
+      token: string
+    ): Promise<any> {
+      const url = AGENT_ENDPOINTS[agentName];
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeout);
+
+        if (response.status === 401) {
+          // Attempt token refresh
+          const newToken = await refreshToken();
+          if (newToken) return callAgentCore(agentName, payload, newToken);
+          throw new Error("Authentication expired. Please log in again.");
+        }
+
+        if (!response.ok) {
+          throw new Error(`Agent ${agentName} returned HTTP ${response.status}`);
+        }
+
+        return await response.json();
+      } catch (err) {
+        clearTimeout(timeout);
+        if (err.name === "AbortError") {
+          throw new Error(`Agent ${agentName} timed out`);
+        }
+        throw err;
+      }
+    }
+
+
+7.4  CORS REQUIREMENTS
+────────────────────────────────────────────────────────────────────────────────
+
+  For the browser to call AgentCore directly, CORS must be configured
+  on the AgentCore endpoints (or via an API Gateway / CloudFront in front):
+
+    Access-Control-Allow-Origin:  https://<your-app-domain>
+    Access-Control-Allow-Headers: Content-Type, Authorization
+    Access-Control-Allow-Methods: POST, OPTIONS
+
+  If AgentCore doesn't support CORS headers natively, place a
+  CloudFront distribution in front that:
+    1. Forwards the Authorization header
+    2. Adds CORS response headers via a Response Headers Policy
+    3. Routes /agents/* to the AgentCore origin
+
+
+7.5  SECURITY CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+  ✅  OAuth2 Authorization Code flow (not Implicit — more secure)
+  ✅  Tokens in memory only (not localStorage)
+  ✅  Proactive token refresh before expiry
+  ✅  HTTPS everywhere (app, Cognito, AgentCore)
+  ✅  CORS locked to specific origin
+  ✅  AbortController timeouts on all API calls
+  ✅  No secrets in client code (Cognito client ID is public, that's OK)
+  ✅  Content Security Policy headers on CloudFront distribution
+
+
+████████████████████████████████████████████████████████████████████████████████
+  PROJECT STRUCTURE (inside /app)
+████████████████████████████████████████████████████████████████████████████████
+
+  app/
+  ├── src/
+  │   ├── main.tsx                         # Entry point
+  │   ├── App.tsx                          # Root component + routing
+  │   │
+  │   ├── auth/                            # Cognito authentication
+  │   │   ├── AuthProvider.tsx             # React context for auth state
+  │   │   ├── useAuth.ts                   # Hook: login, logout, getToken
+  │   │   ├── cognito.ts                   # Cognito config & token exchange
+  │   │   └── ProtectedRoute.tsx           # Redirect to login if no session
+  │   │
+  │   ├── api/                             # AgentCore API layer
+  │   │   ├── agentCore.ts                 # callAgentCore() with JWT + timeout
+  │   │   └── endpoints.ts                 # Agent endpoint URL config
+  │   │
+  │   ├── orchestrator/                    # Pipeline orchestration
+  │   │   ├── PipelineOrchestrator.ts      # runPipeline(), retry logic
+  │   │   ├── insightExtractor.ts          # Extract insights from agent output
+  │   │   └── payloadDecoder.ts            # deepDecode() multi-layer JSON
+  │   │
+  │   ├── db/                              # IndexedDB persistence
+  │   │   ├── database.ts                  # Dexie.js schema & init
+  │   │   ├── executionStore.ts            # CRUD for Execution records
+  │   │   └── stepStore.ts                 # CRUD for AgentStep records
+  │   │
+  │   ├── types/                           # TypeScript interfaces
+  │   │   ├── execution.ts                 # Execution, AgentStep, enums
+  │   │   ├── insights.ts                  # Navigator/Extractor/etc. insights
+  │   │   └── agents.ts                    # Agent names, endpoints, config
+  │   │
+  │   ├── components/                      # Reusable UI components
+  │   │   ├── PipelineVisualizer/
+  │   │   │   ├── PipelineVisualizer.tsx   # Horizontal 4-node graph
+  │   │   │   ├── AgentNode.tsx            # Single agent card
+  │   │   │   └── FlowArrow.tsx            # Arrow between nodes
+  │   │   │
+  │   │   ├── PayloadInspector/
+  │   │   │   ├── PayloadInspector.tsx     # JSON tree viewer
+  │   │   │   ├── JsonTree.tsx             # Collapsible tree with virtual scroll
+  │   │   │   ├── JsonValue.tsx            # Syntax-highlighted value
+  │   │   │   └── SearchBar.tsx            # Search within JSON
+  │   │   │
+  │   │   ├── InsightsPanel/
+  │   │   │   ├── InsightsPanel.tsx        # Agent-specific insights
+  │   │   │   ├── NavigatorInsights.tsx
+  │   │   │   ├── ExtractorInsights.tsx
+  │   │   │   ├── CsvExporterInsights.tsx
+  │   │   │   └── AnalysisInsights.tsx
+  │   │   │
+  │   │   ├── DataLineage/
+  │   │   │   └── DataLineage.tsx          # Side-by-side field evolution
+  │   │   │
+  │   │   ├── ExecutionHistory/
+  │   │   │   ├── ExecutionHistory.tsx      # Table of past runs
+  │   │   │   └── ExecutionRow.tsx          # Single row in history table
+  │   │   │
+  │   │   └── common/
+  │   │       ├── StatusBadge.tsx           # Color-coded status chip
+  │   │       ├── DurationLabel.tsx         # Formatted duration display
+  │   │       └── ErrorBanner.tsx           # Red error alert
+  │   │
+  │   ├── pages/                           # Page-level components
+  │   │   ├── DashboardPage.tsx            # Main page: input + pipeline viz
+  │   │   ├── HistoryPage.tsx              # All past executions
+  │   │   ├── ExecutionDetailPage.tsx      # Single execution deep-dive
+  │   │   └── LoginPage.tsx                # Login redirect
+  │   │
+  │   ├── workers/                         # Web Workers
+  │   │   └── jsonParser.worker.ts         # Offload heavy JSON ops
+  │   │
+  │   └── styles/                          # Global styles / theme
+  │       └── theme.ts                     # Color palette, typography
+  │
+  ├── index.html
+  ├── vite.config.ts
+  ├── tsconfig.json
+  └── package.json
+
+
+████████████████████████████████████████████████████████████████████████████████
+  CONFIGURATION
+████████████████████████████████████████████████████████████████████████████████
+
+  Environment variables (via .env / Vite's import.meta.env):
+
+    VITE_COGNITO_USER_POOL_ID=eu-north-1_XXXXXXXXX
+    VITE_COGNITO_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
+    VITE_COGNITO_DOMAIN=https://your-domain.auth.eu-north-1.amazoncognito.com
+    VITE_COGNITO_REDIRECT_URI=http://localhost:5173/callback
+    VITE_COGNITO_LOGOUT_URI=http://localhost:5173
+
+    VITE_AGENT_NAVIGATOR_URL=https://<host>/agents/agentcore_navigator/invocations
+    VITE_AGENT_EXTRACTOR_URL=https://<host>/agents/agentcore_extractor/invocations
+    VITE_AGENT_CSV_EXPORTER_URL=https://<host>/agents/raw_csv_exporter/invocations
+    VITE_AGENT_ANALYSIS_URL=https://<host>/agents/agentcore_analysis/invocations
+
+    VITE_AGENT_TIMEOUT_NAVIGATOR=120000
+    VITE_AGENT_TIMEOUT_EXTRACTOR=120000
+    VITE_AGENT_TIMEOUT_CSV_EXPORTER=60000
+    VITE_AGENT_TIMEOUT_ANALYSIS=120000
+
+
+████████████████████████████████████████████████████████████████████████████████
+  DEPENDENCIES (to add to package.json)
+████████████████████████████████████████████████████████████████████████████████
+
+  Runtime:
+    react, react-dom          — already installed
+    react-router-dom          — client-side routing
+    dexie                     — IndexedDB wrapper
+    dexie-react-hooks         — React hooks for Dexie
+    uuid                      — generate execution/step IDs
+
+  Dev:
+    @types/uuid               — TypeScript types
+    tailwindcss (optional)    — utility-first CSS
+
+  No backend dependencies.  No Express, no Lambda, no API Gateway.
+
+
+████████████████████████████████████████████████████████████████████████████████
+  SUMMARY OF DESIGN DECISIONS
+████████████████████████████████████████████████████████████████████████████████
+
+  Decision                      Rationale
+  ─────────────────────────────  ──────────────────────────────────────────
+  Client-only (no backend)       Simplest deployment, zero infra to manage
+  IndexedDB for persistence      Survives page reloads, no server database
+  Dexie.js for IndexedDB         Best DX, supports React hooks, typed
+  Web Workers for JSON parsing   Keeps UI responsive for large payloads
+  deepDecode() utility           Handles AgentCore's multi-layer encoding
+  Cognito OAuth2 Code flow       Most secure browser auth flow
+  Tokens in memory only          Prevents XSS token theft
+  Virtual scroll for large JSON  Prevents DOM explosion with 9,551+ items
+  Insight extraction per agent   Pre-computed summaries for quick overview
+  Retry from failure point       Avoids re-running successful agents
+  CloudFront for CORS            If AgentCore can't set CORS headers
+
+
+✅ Design Complete

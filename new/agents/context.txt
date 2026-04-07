@@ -1,0 +1,299 @@
+================================================================================
+  SENTINEL-STATE — Medicaid Fee Schedule Automation Pipeline
+  Project Context & Agent Reference
+================================================================================
+
+OVERVIEW
+--------
+Sentinel-State is an automated pipeline that discovers, downloads, extracts,
+normalises, and stages Medicaid fee-schedule data from U.S. state portals.
+
+The pipeline is composed of four autonomous agents, each deployed as a
+standalone container on AWS AgentCore. Every agent exposes a single
+`POST /invocations` endpoint and communicates via JSON payloads. The output
+of one agent feeds directly into the input of the next.
+
+TECH STACK
+----------
+  • Framework       : strands-agents SDK (Agent, @tool, BedrockModel)
+  • LLM             : Amazon Bedrock (Claude models)
+  • Runtime         : AWS AgentCore (BedrockAgentCoreApp, @app.entrypoint)
+  • Container Base  : ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  • Storage         : Amazon S3 (raw → medicaid-fee-raw, staged → medicaid-fee-stage)
+  • Region          : eu-north-1 (AgentCore & S3), us-east-1 / eu-north-1 (Bedrock)
+
+================================================================================
+  PIPELINE FLOW
+================================================================================
+
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │  1. Navigator │────▶│  2. Extractor│────▶│ 3. CSV       │────▶│ 4. Analysis  │
+  │  "The        │     │  "The Parser"│     │    Exporter   │     │  "The Mapper"│
+  │   Researcher"│     │              │     │              │     │              │
+  └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+   Crawls state        Downloads &          Exports raw data     Maps headers to
+   Medicaid portal,    parses fee-          to CSV & uploads     canonical schema,
+   discovers fee-      schedule files       to S3 (raw bucket)   cleans/transforms
+   schedule URLs       (xlsx, csv, pdf)                          data, uploads to
+                                                                 S3 (stage bucket)
+
+================================================================================
+  AGENT 1 — NAVIGATOR  ("The Researcher")
+================================================================================
+  Location  : agents/navigator/
+  Entrypoint: agents.navigator.agentcore_navigator
+  Key Files :
+    • agent.py              – System prompt, create_navigator_agent(), invoke()
+    • models.py             – NavigatorInput (portal_url), NavigatorOutput
+    • tools/crawl_portal.py – Playwright BFS crawl (AgentCore Browser service
+                              in prod, local Chromium in dev)
+    • tools/filter_datasets.py – Union-Find dedup, format prioritisation,
+                                  LLM relevance scoring
+
+  PURPOSE:
+    Receives a state Medicaid portal URL. Crawls the site using a headless
+    browser, discovers all downloadable fee-schedule files, deduplicates them,
+    and returns a ranked list of relevant datasets.
+
+  INPUT:
+    {
+      "prompt": "<state_portal_url>"
+    }
+
+    Example:
+    {
+      "prompt": "https://extranet-sp.dhss.alaska.gov/hcs/medicaidalaska/Provider/Sites/FeeSchedule.html"
+    }
+
+  OUTPUT:
+    {
+      "success": true,
+      "portal_url": "https://extranet-sp.dhss.alaska.gov/.../FeeSchedule.html",
+      "state_name": "Alaska",
+      "state_code": "",
+      "total_links_discovered": 24,
+      "relevant_datasets": [
+        {
+          "url": "https://…/Fee_Schedule_Physician_FY2026.xlsx",
+          "title": "Physician Fee Schedule FY 2026",
+          "file_type": "xlsx",
+          "category": "physician",
+          "relevance_score": 1,
+          "relevance_reason": "Primary physician fee schedule with CPT/HCPCS codes and reimbursement rates for FY 2026",
+          "page_source_url": "https://…/FeeSchedule.html",
+          "is_current": true,
+          "estimated_date": "FY2026"
+        }
+      ],
+      "crawled_pages": ["https://…/FeeSchedule.html"],
+      "portal_type": "sharepoint",
+      "errors": [],
+      "crawl_timestamp": "2026-04-04T11:31:23.392949+00:00"
+    }
+
+================================================================================
+  AGENT 2 — EXTRACTOR  ("The Parser")
+================================================================================
+  Location  : agents/extractor/
+  Entrypoint: agents.extractor.agentcore_extractor
+  Key Files :
+    • agent.py                  – run_extractor(), save_extracted_data_to_csv()
+    • models.py                 – ExtractorInput, ExtractorOutput, ExtractedTable
+    • agentcore_extractor.py    – @app.entrypoint, payload unwrapping
+
+  PURPOSE:
+    Receives the Navigator output (specifically the relevant_datasets list).
+    Downloads the top dataset file, detects sheets/tables, extracts all rows,
+    maps raw column headers to canonical names using LLM analysis, and returns
+    structured data with quality metrics.
+
+  INPUT:
+    {
+      "prompt": "<JSON string of the full Navigator response>"
+    }
+
+    The prompt value is the entire Navigator output JSON (often double-encoded
+    as a string). The entrypoint unwraps multiple JSON layers automatically.
+
+  OUTPUT:
+    {
+      "success": true,
+      "source_url": "https://…/Fee_Schedule_Physician_FY2026.xlsx",
+      "state_name": "Alaska",
+      "state_code": "",
+      "file_type": "xlsx",
+      "category": "physician",
+      "extracted_tables": [
+        {
+          "sheet_name": "Physician Fee Schedule",
+          "headers": ["Proc Code", "Proc Mod", "OMK", …],
+          "data": [
+            {
+              "procedure_code": "0042T",
+              "procedure_modifier": null,
+              "procedure_description": "CT PERFUSION W/CONTRAST CBF",
+              "requires_medical_justification": null,
+              "requires_comagine_authorization": null,
+              "requires_fiscal_agent_authorization": null,
+              "requires_ndc": null,
+              "rate": "By Report",
+              "billing_notes": null
+            }
+          ],
+          "row_count": 9551,
+          "detected_header_row": 0,
+          "footer_notes": null,
+          "column_mapping": {
+            "Proc Code": "procedure_code",
+            "Proc Mod": "procedure_modifier",
+            "OMK": "procedure_description",
+            "Maximum Allowable": "rate",
+            …
+          },
+          "mapping_confidence": 0.9
+        }
+      ],
+      "file_size_bytes": 603545,
+      "download_timestamp": "2026-04-04T12:46:55.971645Z",
+      "file_metadata": { … },
+      "schema_drift_detected": false,
+      "schema_drift_details": [],
+      "data_quality_issues": [
+        "Row 0, Column 'Requires Medical Justificatio': Header appears truncated",
+        "Row 1, Column 'rate': Non-numeric value 'By Report' found"
+      ],
+      "errors": [],
+      "total_rows_extracted": 9551,
+      "processing_time_seconds": 22.92
+    }
+
+================================================================================
+  AGENT 3 — CSV EXPORTER
+================================================================================
+  Location  : agents/csv_exporter/
+  Entrypoint: agents.csv_exporter.raw_csv_exporter
+  Key Files :
+    • raw_csv_exporter.py       – @app.entrypoint mainFunction(), run_csv_exporter()
+    • models.py                 – CSVExporterInput, CSVExporterOutput
+    • tools/download.py         – download_or_cache_file()
+    • tools/reader.py           – read_and_map_data()
+    • tools/writer.py           – export_to_csv()
+
+  PURPOSE:
+    Receives the Extractor output. Downloads the original file (or uses a
+    cached copy), reads the specified sheet, applies column mappings, and
+    exports the raw data as a CSV file. Uploads the CSV to S3 (raw bucket).
+
+    When the payload contains "extracted_tables" (Extractor output shape),
+    the entrypoint auto-maps the nested structure to flat CSVExporterInput
+    fields (sheet_name, column_mapping, output_path, etc.).
+
+  INPUT:
+    {
+      "prompt": "<JSON string of the full Extractor response>"
+    }
+
+  OUTPUT:
+    {
+      "success": true,
+      "rows_exported": 9552,
+      "columns": ["Proc Code", "Proc Mod", "OMK", …],
+      "output_path": "s3://medicaid-fee-raw/raw_exports/alaska/alaska_raw_data.csv",
+      "error": null,
+      "metadata": {
+        "source_url": "https://…/Fee_Schedule_Physician_FY2026.xlsx",
+        "state_name": "Alaska",
+        "category": "physician",
+        "cached_file_used": false
+      }
+    }
+
+================================================================================
+  AGENT 4 — ANALYSIS  ("The Mapper")
+================================================================================
+  Location  : agents/analysis/
+  Entrypoint: agents.analysis.agentcore_analysis
+  Key Files :
+    • agentcore_analysis.py     – @app.entrypoint invoke(), run_analysis(),
+                                  run(), create_analysis_agent(), chunking logic
+
+  PURPOSE:
+    Receives the S3 path of the raw CSV from the CSV Exporter. Fetches the CSV,
+    analyses headers using an LLM, creates canonical schema-compliant mappings,
+    cleans and transforms all data (unicode cleanup, rate→float, flag→bool),
+    exports the cleaned CSV, and uploads it to S3 (stage bucket).
+
+  INPUT:
+    {
+      "prompt": "<S3 URI from csv_exporter output_path>"
+    }
+
+    Example:
+    {
+      "prompt": "s3://medicaid-fee-raw/raw_exports/alaska/alaska_raw_data.csv"
+    }
+
+  OUTPUT:
+    {
+      "success": true,
+      "output_filepath": "s3://medicaid-fee-stage/cleaned_data/alaska/alaska_raw_data_cleaned.csv"
+    }
+
+  CANONICAL SCHEMA FIELDS:
+    procedure_code  (str)   – HCPCS or CPT code, e.g. "D0120" or "99213"
+    modifier        (str)   – optional procedure modifier, e.g. "TC" (null if absent)
+    fee_amount      (float) – reimbursement rate as a plain number, e.g. 45.50
+    effective_date  (str)   – ISO date YYYY-MM-DD (null if not present)
+    end_date        (str)   – ISO date YYYY-MM-DD (null if not present)
+
+================================================================================
+  S3 BUCKET LAYOUT
+================================================================================
+
+  medicaid-fee-raw/                         ← Raw exports from CSV Exporter
+  └── raw_exports/
+      └── <state>/
+          └── <state>_raw_data.csv
+
+  medicaid-fee-stage/                       ← Cleaned/transformed by Analysis Agent
+  └── cleaned_data/
+      └── <state>/
+          └── <state>_raw_data_cleaned.csv
+
+================================================================================
+  END-TO-END EXAMPLE  (Alaska Physician Fee Schedule)
+================================================================================
+
+  Step 1 — Navigator
+    Input : {"prompt": "https://extranet-sp.dhss.alaska.gov/.../FeeSchedule.html"}
+    Output: Discovers 24 links, returns ranked list with
+            Fee_Schedule_Physician_FY2026.xlsx at relevance_score 1.0
+
+  Step 2 — Extractor
+    Input : {"prompt": "<Navigator JSON>"}
+    Output: Downloads xlsx, extracts "Physician Fee Schedule" sheet,
+            9551 rows, 9 columns, mapping_confidence 0.9
+
+  Step 3 — CSV Exporter
+    Input : {"prompt": "<Extractor JSON>"}
+    Output: Exports 9552 rows to
+            s3://medicaid-fee-raw/raw_exports/alaska/alaska_raw_data.csv
+
+  Step 4 — Analysis
+    Input : {"prompt": "s3://medicaid-fee-raw/raw_exports/alaska/alaska_raw_data.csv"}
+    Output: Cleaned & canonical CSV uploaded to
+            s3://medicaid-fee-stage/cleaned_data/alaska/alaska_raw_data_cleaned.csv
+
+================================================================================
+  DEPLOYMENT NOTES
+================================================================================
+  • Each agent has its own Dockerfile under .bedrock_agentcore/<agent_name>/
+  • Build context is the agent directory (e.g. agents/navigator/)
+  • Package structure is preserved: COPY . /app/agents/<agent_name>/
+  • A top-level /app/agents/__init__.py is created in the Dockerfile
+  • Containers run as non-root user "bedrock_agentcore" (uid 1000)
+  • Temp files written to /tmp/ (container filesystem is ephemeral)
+  • Deploy with: bedrock-agentcore deploy --no-cache
+  • Payload from AgentCore may be multi-layer JSON-encoded; all entrypoints
+    use loop-based unwrapping to handle arbitrary nesting depth
+================================================================================

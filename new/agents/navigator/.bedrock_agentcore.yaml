@@ -1,0 +1,66 @@
+default_agent: agentcore_navigator
+agents:
+  agentcore_navigator:
+    name: agentcore_navigator
+    language: python
+    node_version: '20'
+    entrypoint: /home/sajidansari/leapfrog-projects/Medicaid_Feeschedule/new/agents/navigator/agentcore_navigator.py
+    deployment_type: container
+    runtime_type: null
+    platform: linux/arm64
+    container_runtime: none
+    source_path: /home/sajidansari/leapfrog-projects/Medicaid_Feeschedule/new/agents/navigator
+    aws:
+      execution_role: arn:aws:iam::044528206225:role/AmazonBedrockAgentCoreSDKRuntime-eu-north-1-460874111a
+      execution_role_auto_create: false
+      account: 044528206225
+      region: eu-north-1
+      ecr_repository: 044528206225.dkr.ecr.eu-north-1.amazonaws.com/bedrock-agentcore-agentcore_navigator
+      ecr_auto_create: false
+      s3_path: null
+      s3_auto_create: false
+      network_configuration:
+        network_mode: PUBLIC
+        network_mode_config: null
+      protocol_configuration:
+        server_protocol: HTTP
+      observability:
+        enabled: true
+      lifecycle_configuration:
+        idle_runtime_session_timeout: null
+        max_lifetime: null
+    bedrock_agentcore:
+      agent_id: agentcore_navigator-xhtIlG7a32
+      agent_arn: arn:aws:bedrock-agentcore:eu-north-1:044528206225:runtime/agentcore_navigator-xhtIlG7a32
+      agent_session_id: null
+    codebuild:
+      project_name: bedrock-agentcore-agentcore_navigator-builder
+      execution_role: arn:aws:iam::044528206225:role/AmazonBedrockAgentCoreSDKCodeBuild-eu-north-1-460874111a
+      source_bucket: bedrock-agentcore-codebuild-sources-044528206225-eu-north-1
+    memory:
+      mode: NO_MEMORY
+      memory_id: null
+      memory_arn: null
+      memory_name: null
+      event_expiry_days: 30
+      first_invoke_memory_check_done: false
+      was_created_by_toolkit: false
+    identity:
+      credential_providers: []
+      workload: null
+    aws_jwt:
+      enabled: false
+      audiences: []
+      signing_algorithm: ES384
+      issuer_url: null
+      duration_seconds: 300
+    authorizer_configuration:
+      customJWTAuthorizer:
+        discoveryUrl: https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_cdFYY5Voh/.well-known/openid-configuration
+        allowedClients:
+        - 1mpaf0p3scjsbibnh2c4l2tj7p
+    request_header_configuration: null
+    oauth_configuration: null
+    api_key_env_var_name: null
+    api_key_credential_provider_name: null
+    is_generated_by_agentcore_create: false

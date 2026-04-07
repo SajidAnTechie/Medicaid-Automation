@@ -1,0 +1,16 @@
+services:
+  lambda-url-discovery-local:
+    build:
+      context: .
+      dockerfile: lambdas/url_discovery_handler/Dockerfile.local
+    container_name: lambda_url_discovery_local
+    ports:
+      - "9000:8080"
+    env_file:
+      - .env
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-bedrock}
+      BEDROCK_MODEL: ${BEDROCK_MODEL:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
